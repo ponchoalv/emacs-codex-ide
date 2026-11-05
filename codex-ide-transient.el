@@ -42,6 +42,23 @@
 (autoload 'codex-ide-session-diff-open "codex-ide-diff-view"
   "Open or reuse the canonical session diff buffer for the current project." t)
 
+(autoload 'codex-ide-search-threads "codex-ide-search"
+  "Search full message contents across active Codex threads." t)
+(autoload 'codex-ide-search-project-threads "codex-ide-search"
+  "Search full message contents in the current project." t)
+(autoload 'codex-ide-archive-thread "codex-ide-archive"
+  "Archive a Codex thread through the app-server." t)
+(autoload 'codex-ide-unarchive-thread "codex-ide-archive"
+  "Restore an archived Codex thread." t)
+(autoload 'codex-ide-archived-threads "codex-ide-archive"
+  "Browse archived Codex threads." t)
+(autoload 'codex-ide-remote-control-start "codex-ide-remote"
+  "Start Codex remote control explicitly." t)
+(autoload 'codex-ide-remote-control-pair "codex-ide-remote"
+  "Generate a short-lived Codex device pairing code." t)
+(autoload 'codex-ide-remote-control-stop "codex-ide-remote"
+  "Stop Codex remote control after confirmation." t)
+
 (defvar codex-ide-cli-path)
 (defvar codex-ide-cli-extra-flags)
 (defvar codex-ide-model)
@@ -466,9 +483,15 @@
 			  ["Manage"
 			   ("m" "Manage sessions" codex-ide-status)
 			   ("l" "Live session buffers" codex-ide-session-buffer-list)
-			   ("D" "Session diff (live/transcript/pinned)" codex-ide-session-diff-open)]
+			   ("D" "Session diff (live/transcript/pinned)" codex-ide-session-diff-open)
+                           ("/" "Search contents (all projects)" codex-ide-search-threads)
+                           ("?" "Search contents (this project)" codex-ide-search-project-threads)
+                           ("a" "Archive thread" codex-ide-archive-thread)
+                           ("u" "Unarchive thread" codex-ide-unarchive-thread)
+                           ("A" "Browse archived threads" codex-ide-archived-threads)]
 			  ["Submenus"
 			   ("C" "Agent configuration" codex-ide-agent-config-menu)
+                           ("R" "Remote control" codex-ide-remote-control-menu)
 			   ("d" "Debug" codex-ide-debug-menu)]
 			  ["Navigation"
 			   ("C-g" "Exit" transient-quit-all)]])
@@ -505,6 +528,17 @@
              #'codex-ide--config-menu-commit-history-group)
 (add-hook 'transient-post-exit-hook
           #'codex-ide--config-menu-commit-history-group)
+
+;;;###autoload
+(transient-define-prefix codex-ide-remote-control-menu ()
+  "Manage Codex remote control; opening this menu enables nothing."
+  ["Codex remote control (experimental)"
+   ("s" "Start remote control" codex-ide-remote-control-start)
+   ("p" "Pair device" codex-ide-remote-control-pair)
+   ("x" "Stop remote control" codex-ide-remote-control-stop)]
+  ["Navigation"
+   ("DEL" "Back" transient-quit-one)
+   ("C-g" "Exit" transient-quit-all)])
 
 ;;;###autoload
 (transient-define-prefix codex-ide-debug-menu ()

@@ -276,6 +276,27 @@ When nil, inline diffs never start folded."
   :group 'codex-ide)
 
 ;;;###autoload
+(defcustom codex-ide-transport 'stdio
+  "Transport for newly created Codex sessions.
+`stdio' starts a private app-server process, preserving upstream behavior.
+`shared' connects to an already running local Codex shared daemon.  It does
+not start a server automatically.  Use `codex-ide-remote-control-start'
+explicitly for remote access, or start a local-only daemon with the CLI.
+Changing this value does not migrate existing sessions."
+  :type '(choice (const :tag "Private stdio" stdio)
+                 (const :tag "Local shared daemon" shared))
+  :group 'codex-ide)
+
+;;;###autoload
+(defcustom codex-ide-shared-socket-path nil
+  "Absolute local path to a shared Codex control socket, or nil for default.
+The default follows Codex's CODEX_HOME/app-server-control convention.  Override
+only to connect to a deliberately configured local daemon.  Remote-control
+commands manage the default daemon and reject mismatched overrides."
+  :type '(choice (const :tag "Codex default socket" nil) file)
+  :group 'codex-ide)
+
+;;;###autoload
 (defcustom codex-ide-resume-summary-turn-limit 100
   "How many recent turns to summarize when resuming a stored thread."
   :type 'integer
@@ -327,6 +348,7 @@ thread-list limit."
 (require 'codex-ide-session)
 (require 'codex-ide-loop)
 (require 'codex-ide-delete-session-thread)
+(require 'codex-ide-search)
 
 (provide 'codex-ide)
 

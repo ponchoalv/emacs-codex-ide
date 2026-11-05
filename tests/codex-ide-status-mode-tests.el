@@ -1404,6 +1404,12 @@
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest codex-ide-status-exposes-active-and-archived-browsers ()
+  (should (eq (lookup-key codex-ide-status-mode-map (kbd "A"))
+              #'codex-ide-archived-threads))
+  (should (eq (lookup-key codex-ide-status-mode-map (kbd "T"))
+              #'codex-ide-active-threads)))
+
 (provide 'codex-ide-status-mode-tests)
 
 ;;; codex-ide-status-mode-tests.el ends here

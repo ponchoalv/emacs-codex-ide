@@ -515,6 +515,28 @@
                :command)
               #'codex-ide-show-debug-info)))
 
+(ert-deftest codex-ide-menu-exposes-conversation-management ()
+  (dolist (binding '(("/" . codex-ide-search-threads)
+                     ("?" . codex-ide-search-project-threads)
+                     ("a" . codex-ide-archive-thread)
+                     ("u" . codex-ide-unarchive-thread)
+                     ("A" . codex-ide-archived-threads)
+                     ("R" . codex-ide-remote-control-menu)))
+    (should (eq (codex-ide-test--transient-suffix-prop
+                 (transient-get-suffix 'codex-ide-menu (car binding))
+                 :command)
+                (cdr binding)))))
+
+(ert-deftest codex-ide-remote-menu-exposes-explicit-actions-only ()
+  (dolist (binding '(("s" . codex-ide-remote-control-start)
+                     ("p" . codex-ide-remote-control-pair)
+                     ("x" . codex-ide-remote-control-stop)))
+    (should (eq (codex-ide-test--transient-suffix-prop
+                 (transient-get-suffix 'codex-ide-remote-control-menu
+                                       (car binding))
+                 :command)
+                (cdr binding)))))
+
 (provide 'codex-ide-transient-tests)
 
 ;;; codex-ide-transient-tests.el ends here

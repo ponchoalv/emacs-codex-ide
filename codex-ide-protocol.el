@@ -390,25 +390,73 @@ CALLBACK is called with RESULT and ERROR."
      ((member (alist-get 'author item) '("assistant" assistant)) 'assistant)
      (t nil))))
 
-(cl-defun codex-ide--list-threads (&optional session &key limit sort-key)
-  "List threads for the current working directory using SESSION.
+(defconst codex-ide--persisted-thread-source-kinds
+  ["cli" "vscode" "exec" "appServer" "subAgent" "subAgentReview"
+   "subAgentCompact" "subAgentThreadSpawn" "subAgentOther" "unknown"]
+  "App-server source kinds, explicitly including non-interactive threads.
+Wire names verified against Codex 0.166.0 serialization metadata.")
 
-When LIMIT is nil, use `codex-ide-thread-list-default-limit'.  When
-SORT-KEY is nil, sort by `updated_at'."
+(cl-defun codex-ide--thread-list-page
+    (session &key directory archived cursor limit sort-key source-kinds)
+  "Return one thread/list response for SESSION with the supplied filters.
+Nil DIRECTORY omits cwd; nil ARCHIVED explicitly selects active storage."
+  (codex-ide--request-sync
+   session "thread/list"
+   `((limit . ,(or limit codex-ide-thread-list-default-limit))
+     (sortKey . ,(or sort-key "updated_at"))
+     (archived . ,(if archived t :json-false))
+     ,@(when directory `((cwd . ,directory)))
+     ,@(when cursor `((cursor . ,cursor)))
+     ,@(when source-kinds `((sourceKinds . ,source-kinds))))))
+
+(cl-defun codex-ide--list-threads
+    (&optional session &key limit sort-key
+               (directory nil directory-supplied-p) archived cursor source-kinds)
+  "List one page of threads using SESSION, preserving directory defaults.
+LIMIT and SORT-KEY default to the configured limit and updated_at.
+Explicit nil DIRECTORY means global; ARCHIVED selects archived storage.
+CURSOR and SOURCE-KINDS are optional app-server filters.  For complete
+results across pages, use `codex-ide--list-all-threads'."
   (setq session (or session (codex-ide--get-default-session-for-current-buffer)))
-  (unless session
-    (error "No Codex session available"))
-  (let* ((working-dir (codex-ide-session-directory session))
-         (limit (or limit codex-ide-thread-list-default-limit))
-         (sort-key (or sort-key "updated_at"))
-         (result (codex-ide--request-sync
-                  session
-                  "thread/list"
-                  `((cwd . ,working-dir)
-                    (limit . ,limit)
-                    (sortKey . ,sort-key))))
-         (data (alist-get 'data result)))
-    (append data nil)))
+  (unless session (error "No Codex session available"))
+  (append
+   (alist-get 'data
+              (codex-ide--thread-list-page
+               session :directory (if directory-supplied-p directory
+                                    (codex-ide-session-directory session))
+               :archived archived :cursor cursor :limit limit
+               :sort-key sort-key :source-kinds source-kinds))
+   nil))
+
+(cl-defun codex-ide--list-all-threads (session &key directory archived)
+  "Return all persisted threads from SESSION across every cursor page.
+Nil DIRECTORY means global (omit cwd).  Nil ARCHIVED sends JSON false.
+Include all known persisted sources.  Signal an error on repeated or invalid
+cursors rather than silently returning incomplete results."
+  (unless session (error "No Codex session available"))
+  (let ((seen (make-hash-table :test 'equal)) cursor threads done)
+    (while (not done)
+      (let* ((page (codex-ide--thread-list-page
+                    session :directory directory :archived archived
+                    :cursor cursor
+                    :source-kinds codex-ide--persisted-thread-source-kinds))
+             (next (alist-get 'nextCursor page)))
+        (setq threads (nconc threads (append (alist-get 'data page) nil)))
+        (cond
+         ((null next) (setq done t))
+         ((or (not (stringp next)) (string-empty-p next)
+              (gethash next seen))
+          (error "Invalid or repeated thread/list cursor: %S" next))
+         (t (puthash next t seen) (setq cursor next)))))
+    threads))
+
+(defun codex-ide--archive-thread (session thread-id)
+  "Archive THREAD-ID via SESSION's app-server, never by deleting files."
+  (codex-ide--request-sync session "thread/archive" `((threadId . ,thread-id))))
+
+(defun codex-ide--unarchive-thread (session thread-id)
+  "Restore THREAD-ID via SESSION's app-server and return its response."
+  (codex-ide--request-sync session "thread/unarchive" `((threadId . ,thread-id))))
 
 (defun codex-ide--list-models (&optional session)
   "List available models using SESSION."

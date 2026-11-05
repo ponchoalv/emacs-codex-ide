@@ -1,5 +1,8 @@
 # Codex IDE for Emacs
 
+> Local conversation-management fork: see [FORK.md](FORK.md) for content
+> search, archive/unarchive, remote control, and local installation.
+
 [![GNU Emacs 28.1+](https://img.shields.io/badge/GNU%20Emacs-28.1%2B-blue.svg)](https://www.gnu.org/software/emacs/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 

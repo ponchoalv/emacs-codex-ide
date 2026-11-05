@@ -41,6 +41,7 @@
 (require 'codex-ide-mcp-bridge)
 (require 'codex-ide-mcp-elicitation)
 (require 'codex-ide-protocol)
+(require 'codex-ide-remote)
 (require 'codex-ide-renderer)
 (require 'codex-ide-session-mode)
 (require 'codex-ide-threads)
@@ -182,6 +183,12 @@
     (remhash directory codex-ide--active-buffer-objects)
     (codex-ide--maybe-disable-active-buffer-tracking)))
 
+(defun codex-ide--disconnect-process (process)
+  "Close client PROCESS intentionally, without stopping a shared daemon."
+  (when (process-live-p process)
+    (process-put process 'codex-ide-disconnecting t)
+    (delete-process process)))
+
 (defun codex-ide--teardown-session (session &optional kill-log-buffer)
   "Stop SESSION and clear its internal state.
 When KILL-LOG-BUFFER is non-nil, also kill SESSION's log buffer."
@@ -194,7 +201,7 @@ When KILL-LOG-BUFFER is non-nil, also kill SESSION's log buffer."
           (status (codex-ide-session-status session)))
       (when (process-live-p process)
         (codex-ide-log-message session "Stopping process during session teardown")
-        (delete-process process))
+        (codex-ide--disconnect-process process))
       (when (process-live-p stderr-process)
         (delete-process stderr-process))
       (codex-ide--run-session-event
@@ -220,7 +227,7 @@ When KILL-LOG-BUFFER is non-nil, also kill SESSION's log buffer."
   (dolist (session codex-ide--sessions)
     (codex-ide--delete-session-local-image-temp-files session)
     (when (process-live-p (codex-ide-session-process session))
-      (delete-process (codex-ide-session-process session)))))
+      (codex-ide--disconnect-process (codex-ide-session-process session)))))
 
 (add-hook 'kill-emacs-hook #'codex-ide--cleanup-all-sessions)
 
@@ -237,6 +244,7 @@ When KILL-LOG-BUFFER is non-nil, also kill SESSION's log buffer."
                     (version . "0.2.0")))
      (capabilities . ((experimentalApi . t)
                       ,@(codex-ide-mcp-elicitation-capabilities)))))
+  (codex-ide--jsonrpc-send session '((method . "initialized")))
   (codex-ide--set-session-status session "idle" 'initialized)
   (unless (codex-ide--query-only-session-p session)
     (codex-ide-mention-refresh-skill-cache session))
@@ -298,31 +306,38 @@ protocol requests such as thread listing."
            (process nil))
       (condition-case err
           (progn
-            (setq stderr-process
-                  (make-pipe-process
-                   :name (format "codex-ide-stderr[%s]" process-label)
-                   :buffer nil
-                   :coding 'utf-8-unix
-                   :noquery t
-                   :filter #'codex-ide--stderr-filter))
-            (codex-ide--discard-process-buffer stderr-process)
-            (setq process
-                  (make-process
-                   :name (format "codex-ide[%s]" process-label)
-                   :buffer nil
-                   :command (codex-ide--app-server-command)
-                   :coding 'utf-8-unix
-                   :filter #'codex-ide--process-filter
-                   :sentinel #'codex-ide--process-sentinel
-                   :stderr stderr-process))
+            (pcase codex-ide-transport
+              ('shared
+               (setq process
+                     (codex-ide-remote--connect
+                      :name (format "codex-ide[%s]" process-label)
+                      :filter #'codex-ide--process-filter
+                      :sentinel #'codex-ide--process-sentinel)))
+              ('stdio
+               (setq stderr-process
+                     (make-pipe-process
+                      :name (format "codex-ide-stderr[%s]" process-label)
+                      :buffer nil :coding 'utf-8-unix :noquery t
+                      :filter #'codex-ide--stderr-filter))
+               (codex-ide--discard-process-buffer stderr-process)
+               (setq process
+                     (make-process
+                      :name (format "codex-ide[%s]" process-label)
+                      :buffer nil :command (codex-ide--app-server-command)
+                      :coding 'utf-8-unix :filter #'codex-ide--process-filter
+                      :sentinel #'codex-ide--process-sentinel
+                      :stderr stderr-process)))
+              (_ (user-error "Unknown codex-ide-transport: %S" codex-ide-transport)))
             (setf (codex-ide-session-process session) process)
             (setf (codex-ide-session-stderr-process session) stderr-process)
             (process-put process 'codex-session session)
-            (process-put stderr-process 'codex-session session)
+            (when stderr-process
+              (process-put stderr-process 'codex-session session))
             (when buffer
               (codex-ide--initialize-session-buffer session buffer working-dir))
             (set-process-query-on-exit-flag process nil)
-            (set-process-query-on-exit-flag stderr-process nil)
+            (when stderr-process
+              (set-process-query-on-exit-flag stderr-process nil))
             (codex-ide--set-session session)
             (codex-ide-log-message
              session
@@ -330,10 +345,11 @@ protocol requests such as thread listing."
                  "Created session buffer %s"
                "Created query-only session")
              (and buffer (buffer-name buffer)))
-            (codex-ide-log-message
-             session
-             "Starting process: %s"
-             (string-join (codex-ide--app-server-command) " "))
+            (if (eq codex-ide-transport 'shared)
+                (codex-ide-log-message session "Attached to shared local daemon")
+              (codex-ide-log-message
+               session "Starting process: %s"
+               (string-join (codex-ide--app-server-command) " ")))
             (codex-ide--run-session-event
              'created
              session
@@ -341,9 +357,13 @@ protocol requests such as thread listing."
              :buffer buffer
              :status (codex-ide-session-status session))
             session)
-        (error
+        ((error quit)
+         (codex-ide--disconnect-process process)
          (when (process-live-p stderr-process)
            (delete-process stderr-process))
+         (when (and (not reuse-buffer) (buffer-live-p buffer))
+           (kill-buffer buffer))
+         (when (eq (car err) 'quit) (signal 'quit nil))
          (signal 'user-error
                  (list
                   (codex-ide--format-session-error-message
@@ -382,6 +402,17 @@ protocol requests such as thread listing."
   (codex-ide--ensure-input-prompt session)
   session)
 
+(defun codex-ide--session-uses-configured-transport-p (session)
+  "Whether SESSION uses the currently configured transport and shared socket."
+  (let* ((process (and session (codex-ide-session-process session)))
+         (socket (and process (process-get process 'codex-ws-socket))))
+    (pcase codex-ide-transport
+      ('stdio (not socket))
+      ('shared (and socket
+                    (equal (file-truename socket)
+                           (file-truename (codex-ide-remote--socket-path)))))
+      (_ nil))))
+
 (defun codex-ide--query-only-session-for-directory (&optional directory)
   "Return the live query-only session for DIRECTORY, if any."
   (let ((directory (codex-ide--normalize-directory
@@ -390,6 +421,7 @@ protocol requests such as thread listing."
      (lambda (session)
        (and (codex-ide--live-session-p session)
             (codex-ide--query-only-session-p session)
+            (codex-ide--session-uses-configured-transport-p session)
             (equal (codex-ide-session-directory session) directory)))
      codex-ide--sessions)))
 
@@ -401,9 +433,15 @@ protocol requests such as thread listing."
                           (codex-ide--normalize-directory
                            (or directory (codex-ide--get-working-directory))))
                    (codex-ide--live-session-p session)
+                   (codex-ide--session-uses-configured-transport-p session)
                    (not (codex-ide--query-only-session-p session)))
           session))
-      (codex-ide--last-active-session-for-directory directory)
+      (seq-find
+       (lambda (session)
+         (and (codex-ide--live-session-p session)
+              (not (codex-ide--query-only-session-p session))
+              (codex-ide--session-uses-configured-transport-p session)))
+       (codex-ide--sessions-for-directory directory t))
       (codex-ide--query-only-session-for-directory directory)))
 
 (defun codex-ide--prepare-session-operations ()
@@ -435,6 +473,7 @@ protocol requests such as thread listing."
      (lambda (session)
        (and (codex-ide--live-session-p session)
             (not (codex-ide--query-only-session-p session))
+            (codex-ide--session-uses-configured-transport-p session)
             (equal (codex-ide-session-directory session) directory)
             (not (codex-ide-session-thread-id session))
             (string= (codex-ide-session-status session) "idle")))
@@ -465,6 +504,57 @@ protocol requests such as thread listing."
       (codex-ide--schedule-usage-refresh session)
       session)))
 
+(defun codex-ide--shared-session-p (session)
+  "Whether SESSION is a client of a local shared daemon."
+  (when-let* ((process (codex-ide-session-process session)))
+    (process-get process 'codex-ws-socket)))
+
+(defun codex-ide--idle-resume-snapshot-p (snapshot thread-id &optional allow-unloaded)
+  "Whether SNAPSHOT describes idle THREAD-ID with its history.
+ALLOW-UNLOADED also accepts `notLoaded' for the preliminary persisted read,
+never for the subscribed resume snapshot."
+  (let* ((thread (alist-get 'thread snapshot))
+         (status (alist-get 'status thread)))
+    (and (equal (alist-get 'id thread) thread-id)
+         (assoc 'turns thread)
+         (member (if (listp status) (alist-get 'type status) status)
+                 (if allow-unloaded '("idle" "notLoaded") '("idle"))))))
+
+(defun codex-ide--resume-event-unsafe-p (message thread-id)
+  "Whether MESSAGE makes idle-only attachment to THREAD-ID unsafe."
+  (let* ((method (alist-get 'method message))
+         (params (alist-get 'params message))
+         (id (or (alist-get 'threadId params)
+                 (alist-get 'id (alist-get 'thread params))))
+         (status (or (alist-get 'status params)
+                     (alist-get 'status (alist-get 'thread params)))))
+    (and (or (null id) (equal id thread-id))
+         (or (alist-get 'id message)
+             (equal method "error")
+             (and (string-match-p "\\`\\(?:thread/\\|turn/\\|item/\\)" method)
+                  (not (member method '("thread/started" "thread/settings/updated"
+                                        "thread/tokenUsage/updated" "thread/status/changed"))))
+             (and (member method '("thread/started" "thread/status/changed"))
+                  (not (equal (if (listp status) (alist-get 'type status) status)
+                              "idle")))))))
+
+(defun codex-ide--request-idle-shared-resume (session thread-id params)
+  "Subscribe SESSION to idle THREAD-ID using PARAMS and return snapshot/events.
+Without an event watermark, replaying an in-flight snapshot can duplicate or
+lose output.  Refuse a busy or racing attachment rather than inventing one.
+Established connections may still receive turns initiated by other clients."
+  (codex-ide--session-metadata-put session :resume-hydrating t)
+  (codex-ide--session-metadata-put session :resume-events nil)
+  ;; The caller owns the hydration guard through rendering and replay too.
+  (let* ((result (codex-ide--request-sync session "thread/resume" params))
+         (events (reverse (codex-ide--session-metadata-get session :resume-events))))
+    (unless (and (codex-ide--idle-resume-snapshot-p result thread-id)
+                 (not (seq-some (lambda (event)
+                                  (codex-ide--resume-event-unsafe-p event thread-id))
+                                events)))
+      (user-error "Shared thread became busy while attaching; wait until idle and resume again"))
+    (cons result events)))
+
 (defun codex-ide--resume-thread-into-session (session thread-id action)
   "Attach SESSION to THREAD-ID and optionally replay prior transcript."
   (unless session
@@ -473,6 +563,8 @@ protocol requests such as thread listing."
                (not (string-empty-p thread-id)))
     (error "Invalid thread id: %S" thread-id))
   (let* ((resume-start (float-time))
+         (shared-p (codex-ide--shared-session-p session))
+         (deferred nil)
          (read-start (float-time))
          (thread-read
           (condition-case err
@@ -490,15 +582,24 @@ protocol requests such as thread listing."
      session
      "Resume thread/read completed in %.0fms"
      (codex-ide--elapsed-ms read-start))
+    (when (and shared-p
+               (not (codex-ide--idle-resume-snapshot-p thread-read thread-id t)))
+      (user-error "Shared attachment requires an idle thread with readable history; wait until idle and resume again"))
+    (condition-case err
+        (progn
     (codex-ide--clear-session-model-name session)
     (codex-ide--remember-model-name session thread-read)
     (let* ((thread-resume-start (float-time))
-           (result
-            (codex-ide--request-sync
-             session
-             "thread/resume"
-             (with-current-buffer (codex-ide-session-buffer session)
-               (codex-ide--thread-resume-params thread-id session)))))
+           (params (with-current-buffer (codex-ide-session-buffer session)
+                     (codex-ide--thread-resume-params thread-id session)))
+           (attachment (when shared-p
+                         (codex-ide--request-idle-shared-resume session thread-id params)))
+           (result (if shared-p (car attachment)
+                     (codex-ide--request-sync session "thread/resume" params))))
+      (when shared-p
+        ;; The pre-subscription read can be stale.  Render the subscribed
+        ;; snapshot instead, then replay only non-activity metadata events.
+        (setq thread-read result deferred (cdr attachment)))
       (codex-ide-log-message
        session
        "Resume thread/resume completed in %.0fms"
@@ -514,17 +615,40 @@ protocol requests such as thread listing."
      :action action)
     (codex-ide--session-metadata-put session :session-context-sent t)
     (codex-ide-log-message session "%s thread %s" action thread-id)
-    (when thread-read
+    (when (and thread-read
+               (or (not shared-p) (alist-get 'turns (alist-get 'thread thread-read))))
       (let ((restore-start (float-time)))
         (codex-ide--restore-thread-read-transcript session thread-read)
         (codex-ide-log-message
          session
          "Resume transcript restore completed in %.0fms"
          (codex-ide--elapsed-ms restore-start))))
+    (when shared-p
+      (setq deferred (reverse (codex-ide--session-metadata-get session :resume-events)))
+      (when (seq-some (lambda (event)
+                       (codex-ide--resume-event-unsafe-p event thread-id)) deferred)
+        (user-error "Shared thread became busy while rendering history; wait until idle and resume again"))
+      (codex-ide--session-metadata-put session :resume-events nil)
+      (codex-ide--session-metadata-put session :resume-hydrating nil))
+    (dolist (event deferred)
+      (if (alist-get 'id event)
+          (codex-ide--handle-server-request session event)
+        (codex-ide--handle-notification session event)))
     (codex-ide-log-message
      session
      "Resume thread setup completed in %.0fms"
      (codex-ide--elapsed-ms resume-start)))
+      ((error quit)
+       (when shared-p
+         (codex-ide--session-metadata-put session :resume-events nil)
+         (codex-ide--session-metadata-put session :resume-hydrating nil)
+         ;; Includes RPC loss, renderer/hook failure, cancellation, and replay
+         ;; errors.  Never leave an uncertain subscription attached.
+         (let ((inhibit-quit t)) (codex-ide--teardown-session session t))
+         (setf (codex-ide-session-thread-id session) nil
+               (codex-ide-session-current-turn-id session) nil
+               (codex-ide-session-last-thread-attached-at session) nil))
+       (signal (car err) (cdr err)))))
   session)
 
 (defun codex-ide--session-for-current-project ()
@@ -631,7 +755,7 @@ protocol requests such as thread listing."
                   (list (error-message-string err) stderr-tail)
                   "Codex startup failed")))
            (when (process-live-p (codex-ide-session-process created-session))
-             (delete-process (codex-ide-session-process created-session)))
+             (codex-ide--disconnect-process (codex-ide-session-process created-session)))
            (codex-ide--show-session-buffer created-session)
            (codex-ide--cleanup-session created-session)
            (signal 'user-error
@@ -646,7 +770,7 @@ protocol requests such as thread listing."
        (when created-session
          (codex-ide-log-message created-session "Session startup aborted")
          (when (process-live-p (codex-ide-session-process created-session))
-           (delete-process (codex-ide-session-process created-session)))
+           (codex-ide--disconnect-process (codex-ide-session-process created-session)))
          (when (buffer-live-p (codex-ide-session-buffer created-session))
            (kill-buffer (codex-ide-session-buffer created-session)))
          (codex-ide--cleanup-session created-session))
@@ -669,6 +793,11 @@ protocol requests such as thread listing."
        (codex-ide-session-buffer session)
        (concat line "\n")
        'shadow))
+     ((and (alist-get 'method message)
+           (codex-ide--session-metadata-get session :resume-hydrating))
+      (codex-ide--session-metadata-put
+       session :resume-events
+       (cons message (codex-ide--session-metadata-get session :resume-events))))
      ((alist-get 'method message)
       (if (alist-get 'id message)
           (progn
@@ -687,41 +816,64 @@ protocol requests such as thread listing."
 (defun codex-ide--process-filter (process chunk)
   "Handle app-server PROCESS output CHUNK."
   (when-let* ((session (process-get process 'codex-session)))
-    (codex-ide-log-message session "Received process chunk (%d chars)" (length chunk))
-    (let* ((pending (concat (or (codex-ide-session-partial-line session) "")
-                            chunk))
-           (lines (split-string pending "\n")))
-      (setf (codex-ide-session-partial-line session) (car (last lines)))
-      (dolist (line (butlast lines))
-        (unless (string-empty-p line)
-          (codex-ide--process-message session line))))))
+    (when (and (eq process (codex-ide-session-process session))
+               (not (process-get process 'codex-ide-disconnecting)))
+      (codex-ide-log-message session "Received process chunk (%d chars)" (length chunk))
+      (let* ((pending (concat (or (codex-ide-session-partial-line session) "")
+                              chunk))
+             (lines (split-string pending "\n")))
+        (setf (codex-ide-session-partial-line session) (car (last lines)))
+        (dolist (line (butlast lines))
+          (unless (string-empty-p line)
+            (codex-ide--process-message session line)))))))
 
 (defun codex-ide--process-sentinel (process event)
-  "Handle app-server PROCESS EVENT."
+  "Handle app-server PROCESS EVENT, ignoring obsolete and repeated events."
   (when-let* ((session (process-get process 'codex-session)))
-    (let ((buffer (codex-ide-session-buffer session)))
-      (codex-ide-log-message session "Process event: %s" (string-trim event))
-      (if (process-live-p process)
-          (progn
-            (codex-ide--set-session-status
-             session
-             (string-trim event)
-             'process-event)
+    (when (and (eq process (codex-ide-session-process session))
+               (not (process-get process 'codex-ide-disconnected)))
+      (let ((buffer (codex-ide-session-buffer session))
+            (live (process-live-p process))
+            (intentional (process-get process 'codex-ide-disconnecting)))
+        (unless live
+          (process-put process 'codex-ide-disconnected t)
+          ;; Resolve pending requests before dropping metadata.  A disconnected
+          ;; shared client must not leave asynchronous callers hanging forever.
+          (let ((pending (codex-ide-session-pending-requests session)) callbacks)
+            (when (hash-table-p pending)
+              (maphash (lambda (_id callback) (push callback callbacks)) pending)
+              (clrhash pending)
+              (dolist (callback callbacks)
+                (ignore-errors
+                  (funcall callback nil '((code . -32000)
+                                          (message . "Codex connection closed"))))))))
+        (unless intentional
+          (codex-ide-log-message session "Process event: %s" (string-trim event))
+          (cond
+           (live
+            (codex-ide--set-session-status session (string-trim event) 'process-event)
             (codex-ide--update-header-line session)
-            (codex-ide-transcript-append-to-buffer
-             buffer
-             (format "\n[Codex process %s]\n" (string-trim event))
-             'shadow))
-        (let ((classification
-               (codex-ide--render-session-error
-                session
-                (list (string-trim event)
-                      (codex-ide--session-metadata-get session :stderr-tail))
-                "Codex process exited")))
-          (codex-ide--recover-from-session-error session classification)))
-      (unless (process-live-p process)
-        (codex-ide-log-message session "Process exited")
-        (codex-ide--cleanup-session session)))))
+            (when (buffer-live-p buffer)
+              (codex-ide-transcript-append-to-buffer
+               buffer (format "\n[Codex process %s]\n" (string-trim event)) 'shadow)))
+           ((or (process-get process 'codex-ws-ready)
+                (codex-ide--query-only-session-p session))
+            ;; Never auto-restart a shared daemon or recover by spawning stdio.
+            (codex-ide--set-session-status session "disconnected" 'process-event)
+            (codex-ide--update-header-line session)
+            (when (buffer-live-p buffer)
+              (codex-ide-transcript-append-to-buffer
+               buffer "\n[Codex connection closed; open a new session to reconnect]\n"
+               'shadow)))
+           (t
+            (let ((classification
+                   (codex-ide--render-session-error
+                    session
+                    (list (string-trim event)
+                          (codex-ide--session-metadata-get session :stderr-tail))
+                    "Codex process exited")))
+              (codex-ide--recover-from-session-error session classification)))))
+        (unless live (codex-ide--cleanup-session session))))))
 
 ;;;###autoload
 (defun codex-ide ()
@@ -789,7 +941,7 @@ protocol requests such as thread listing."
            "thread/unsubscribe"
            `((threadId . ,(codex-ide-session-thread-id session))))))
       (codex-ide-log-message session "Stopping process")
-      (delete-process (codex-ide-session-process session))
+      (codex-ide--disconnect-process (codex-ide-session-process session))
       (when (buffer-live-p buffer)
         (let ((kill-buffer-query-functions nil))
           (kill-buffer buffer)))
@@ -873,7 +1025,7 @@ protocol requests such as thread listing."
                   (list (error-message-string err) stderr-tail)
                   "Codex reset failed")))
            (when (process-live-p (codex-ide-session-process new-session))
-             (delete-process (codex-ide-session-process new-session)))
+             (codex-ide--disconnect-process (codex-ide-session-process new-session)))
            (codex-ide--show-session-buffer new-session)
            (codex-ide--cleanup-session new-session)
            (signal 'user-error

@@ -89,6 +89,10 @@ while 1 would fully replace the background with the foreground color."
     map)
   "Keymap for `codex-ide-status-mode'.")
 
+(autoload 'codex-ide-archived-threads "codex-ide-archive" nil t)
+(autoload 'codex-ide-active-threads "codex-ide-archive" nil t)
+(define-key codex-ide-status-mode-map (kbd "A") #'codex-ide-archived-threads)
+(define-key codex-ide-status-mode-map (kbd "T") #'codex-ide-active-threads)
 (define-key codex-ide-status-mode-map (kbd "+") #'codex-ide)
 (define-key codex-ide-status-mode-map (kbd "D") #'codex-ide-status-mode-delete-thing-at-point)
 (define-key codex-ide-status-mode-map (kbd "K") #'codex-ide-status-mode-kill-buffer-at-point)

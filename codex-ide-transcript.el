@@ -5013,6 +5013,10 @@ When CLOSING-NOTE is non-nil, append it before restoring the prompt."
                         session
                         :queued-prompts))
         (active-prompt (codex-ide--input-prompt-active-p session)))
+    (codex-ide--session-metadata-put
+     session :local-user-echoes
+     (cl-remove turn-id (codex-ide--session-metadata-get session :local-user-echoes)
+                :key #'car :test #'equal))
     (codex-ide--clear-pending-output-indicator session)
     (codex-ide--close-current-message-streaming-markdown session)
     (when closing-note
@@ -5559,8 +5563,8 @@ Signal an error when THREAD-READ lacks replayable transcript items."
 (defun codex-ide--mark-approval-resolved (approval label)
   "Update APPROVAL's transcript block to show resolved LABEL."
   (let* ((view (codex-ide-approvals-data-view approval))
-         (buffer (marker-buffer (plist-get view :status-marker)))
          (status-marker (plist-get view :status-marker))
+         (buffer (and (markerp status-marker) (marker-buffer status-marker)))
          (start-marker (plist-get view :start-marker))
          (end-marker (plist-get view :end-marker)))
     (when (and (buffer-live-p buffer)
@@ -5820,17 +5824,19 @@ still records LABEL."
        (codex-ide-renderer-insert-read-only "\n")
        (list :metadata (list :key-actions (nreverse key-actions)))))))
 
-(defun codex-ide--schedule-interactive-request (session body on-quit on-error)
-  "Run BODY for SESSION on the next tick with shared quit/error handling."
+(cl-defun codex-ide--schedule-interactive-request
+    (session body on-quit on-error &key request-id)
+  "Run BODY for SESSION on the next tick unless REQUEST-ID was resolved."
   (run-at-time
    0 nil
    (lambda ()
-     (condition-case err
-         (funcall body)
-       (quit
-        (funcall on-quit))
-       (error
-        (funcall on-error err))))))
+     (unless (member request-id (codex-ide--session-metadata-get session :resolved-server-requests))
+       (condition-case err
+           (funcall body)
+         (quit
+          (funcall on-quit))
+         (error
+          (funcall on-error err)))))))
 
 (defun codex-ide--elicitation-choice-options (field)
   "Return button options for elicitation FIELD."
@@ -6074,7 +6080,8 @@ still records LABEL."
    kind
    params
    :status 'queued
-   :turn-id (codex-ide-session-current-turn-id session))
+   :turn-id (or (alist-get 'turnId params)
+                (codex-ide-session-current-turn-id session)))
   (codex-ide--set-session-status session "approval" 'approval-requested)
   (codex-ide--refresh-input-placeholder session)
   (codex-ide--update-header-line session)
@@ -6221,7 +6228,8 @@ still records LABEL."
       session
       "Command approval failed: %s"
       (error-message-string err))
-     (codex-ide--jsonrpc-send-response session id '((decision . "cancel"))))))
+     (codex-ide--jsonrpc-send-response session id '((decision . "cancel"))))
+   :request-id id))
 
 (defun codex-ide--handle-file-change-approval (&optional session id params)
   "Handle a file-change approval request for SESSION."
@@ -6238,7 +6246,8 @@ still records LABEL."
       session
       "File-change approval failed: %s"
       (error-message-string err))
-     (codex-ide--jsonrpc-send-response session id '((decision . "cancel"))))))
+     (codex-ide--jsonrpc-send-response session id '((decision . "cancel"))))
+   :request-id id))
 
 (defun codex-ide--handle-permissions-approval (&optional session id params)
   "Handle a permissions approval request for SESSION."
@@ -6255,7 +6264,8 @@ still records LABEL."
       session
       "Permissions approval failed: %s"
       (error-message-string err))
-     (codex-ide--jsonrpc-send-response session id '((permissions . []))))))
+     (codex-ide--jsonrpc-send-response session id '((permissions . []))))
+   :request-id id))
 
 (defun codex-ide--handle-elicitation-request (&optional session id params)
   "Handle an MCP elicitation request for SESSION."
@@ -6281,7 +6291,8 @@ still records LABEL."
       "Elicitation request failed: %s"
       (error-message-string err))
      (codex-ide--jsonrpc-send-error session id -32603
-                                    (error-message-string err)))))
+                                    (error-message-string err)))
+   :request-id id))
 
 (defun codex-ide--handle-server-request (&optional session message)
   "Handle a server-initiated request MESSAGE for SESSION."
@@ -6290,24 +6301,31 @@ still records LABEL."
         (method (alist-get 'method message))
         (params (alist-get 'params message)))
     (codex-ide-log-message session "Received server request %s (id=%s)" method id)
-    (pcase method
-      ((or "elicitation/create"
-           "mcpServer/elicitation/request")
-       (codex-ide--handle-elicitation-request session id params))
-      ("item/commandExecution/requestApproval"
-       (codex-ide--handle-command-approval session id params))
-      ("item/fileChange/requestApproval"
-       (codex-ide--handle-file-change-approval session id params))
-      ("item/permissions/requestApproval"
-       (codex-ide--handle-permissions-approval session id params))
-      (_
-       (codex-ide-log-message session "Unsupported server request %s" method)
-       (codex-ide--append-to-buffer
-        (codex-ide-session-buffer session)
-        (format "\n[Codex requested unsupported method %s]\n" method)
-        'warning)
-       (codex-ide--jsonrpc-send-error session id -32601
-                                      (format "Unsupported method: %s" method))))))
+    (cond
+     ((not (codex-ide--notification-belongs-to-session-p session params))
+      ;; Another client may own this request.  Do not answer on its behalf.
+      (codex-ide-log-message session "Ignoring foreign server request %s" id))
+     ((member id (codex-ide--session-metadata-get session :resolved-server-requests))
+      (codex-ide-log-message session "Ignoring resolved server request %s" id))
+     (t
+      (pcase method
+        ((or "elicitation/create"
+             "mcpServer/elicitation/request")
+         (codex-ide--handle-elicitation-request session id params))
+        ("item/commandExecution/requestApproval"
+         (codex-ide--handle-command-approval session id params))
+        ("item/fileChange/requestApproval"
+         (codex-ide--handle-file-change-approval session id params))
+        ("item/permissions/requestApproval"
+         (codex-ide--handle-permissions-approval session id params))
+        (_
+         (codex-ide-log-message session "Unsupported server request %s" method)
+         (codex-ide--append-to-buffer
+          (codex-ide-session-buffer session)
+          (format "\n[Codex requested unsupported method %s]\n" method)
+          'warning)
+         (codex-ide--jsonrpc-send-error session id -32601
+                                        (format "Unsupported method: %s" method))))))))
 
 (defun codex-ide--append-notification-additional-details (session details)
   "Append notification DETAILS to SESSION."
@@ -6334,15 +6352,98 @@ still records LABEL."
                "\n")
        'shadow))))
 
-(defun codex-ide--notification-belongs-to-session-p (session params)
-  "Return non-nil when notification PARAMS should mutate SESSION.
-Notifications without a `threadId' are treated as session-scoped for backward
-compatibility with older app-server payloads and global notifications."
-  (let ((notification-thread-id (alist-get 'threadId params))
-        (session-thread-id (codex-ide-session-thread-id session)))
-    (or (null notification-thread-id)
-        (null session-thread-id)
-        (equal notification-thread-id session-thread-id))))
+(defun codex-ide--notification-belongs-to-session-p (session params &optional method)
+  "Return non-nil when PARAMS belong to SESSION's attached thread.
+Legacy stdio notifications remain connection-scoped before attachment, except
+`thread/started'.  Only the initiating RPC result may bind a new thread.
+METHOD is omitted for requests, which require matching explicit identities."
+  (let* ((nested-thread-id (alist-get 'id (alist-get 'thread params)))
+         (thread-id (or (alist-get 'threadId params) nested-thread-id))
+         (session-thread-id (codex-ide-session-thread-id session))
+         (network-p (and (processp (codex-ide-session-process session))
+                         (eq (process-type (codex-ide-session-process session)) 'network))))
+    (if (or (null method) thread-id
+            (and method (string-match-p "\\`\\(?:thread/\\|turn/\\|item/\\)" method)))
+        (and (not (codex-ide--query-only-session-p session))
+             (or (null nested-thread-id) (equal nested-thread-id thread-id))
+             (or (and thread-id (equal thread-id session-thread-id))
+                 (and (null session-thread-id) (not network-p) method
+                      (not (equal method "thread/started")))
+                 (and (null thread-id) (or session-thread-id (not network-p)))))
+      t)))
+
+(defun codex-ide--notification-current-turn-p (session method params)
+  "Return non-nil unless METHOD and PARAMS refer to a stale turn in SESSION."
+  (let ((turn-id (or (alist-get 'turnId params)
+                     (alist-get 'id (alist-get 'turn params)))))
+    (or (equal method "turn/started")
+        (null turn-id)
+        (equal turn-id (codex-ide-session-current-turn-id session)))))
+
+(defun codex-ide--server-request-resolved (session id)
+  "Forget local controls for SESSION request ID without sending a response.
+Remember even unknown IDs so a replayed request cannot resurrect its UI."
+  (unless (member id (codex-ide--session-metadata-get session :resolved-server-requests))
+    (codex-ide--session-metadata-put
+     session :resolved-server-requests
+     (cons id (codex-ide--session-metadata-get session :resolved-server-requests)))
+    (when-let* ((approval (codex-ide-approvals-data-get session id)))
+      (when (memq (plist-get approval :status) '(active queued))
+        (codex-ide--mark-approval-resolved approval "Resolved elsewhere")
+        (codex-ide-approvals-data-resolve session id 'resolved :clear-view t)
+        (unless (codex-ide--active-approval-p session)
+          (codex-ide--render-next-queued-approval session))
+        (codex-ide--set-session-status
+         session (codex-ide--status-preserving-unresolved-approvals
+                  session (if (codex-ide-session-current-turn-id session)
+                              "running" "idle"))
+         'approval-resolved)
+        (codex-ide--refresh-input-placeholder session)
+        (codex-ide--update-header-line session)
+        (codex-ide--sync-session-approval-minor-mode session)))))
+
+(defun codex-ide--render-live-user-message (session item &optional turn-id)
+  "Render external user ITEM once for SESSION and TURN-ID, not a local echo."
+  (setq turn-id (or turn-id (codex-ide-session-current-turn-id session)))
+  (if (codex-ide--session-metadata-get session :local-turn-start-pending)
+      (codex-ide--session-metadata-put
+       session :pending-user-message-items
+       (cons (cons turn-id item)
+             (codex-ide--session-metadata-get session :pending-user-message-items)))
+    (let* ((key (list turn-id (alist-get 'id item)))
+           (seen (codex-ide--session-metadata-get session :rendered-user-message-items))
+           (text (codex-ide--thread-read-display-user-text
+                  (codex-ide--thread-read--message-text item)))
+           (buffer (codex-ide-session-buffer session)))
+      (when (and text (not (member key seen)) (buffer-live-p buffer))
+        (if (member (cons turn-id text)
+                    (codex-ide--session-metadata-get session :local-user-echoes))
+            ;; Consume exactly one matching local submission.  Multiple steer
+            ;; RPCs may finish before any user-message notification arrives.
+            (codex-ide--session-metadata-put
+             session :local-user-echoes
+             (cl-remove (cons turn-id text)
+                        (codex-ide--session-metadata-get session :local-user-echoes)
+                        :test #'equal :count 1))
+          (with-current-buffer buffer
+            (let* ((inhibit-read-only t)
+                   (restore-point (codex-ide--input-point-marker session))
+                   (active-boundary (codex-ide--active-input-boundary-marker buffer))
+                   (position (codex-ide--transcript-insertion-position buffer))
+                   (advance (and active-boundary (= position active-boundary))))
+              (save-excursion
+                (goto-char position)
+                (codex-ide--with-transcript-render-transaction-at (session buffer position)
+                  (let ((range (codex-ide-renderer-insert-restored-user-message text)))
+                    (unless (seq-some (lambda (entry)
+                                        (equal (plist-get entry :turn-id) turn-id))
+                                      (codex-ide--turn-start-index session))
+                      (codex-ide--record-turn-start session turn-id (copy-marker (car range)))))
+                  (codex-ide--finish-transcript-append
+                   buffer position (point) active-boundary advance session)))
+              (codex-ide--restore-input-point-marker restore-point))))
+        (codex-ide--session-metadata-put
+         session :rendered-user-message-items (cons key seen))))))
 
 (defun codex-ide--handle-notification (&optional session message)
   "Handle a notification MESSAGE for SESSION."
@@ -6351,7 +6452,8 @@ compatibility with older app-server payloads and global notifications."
         (params (alist-get 'params message))
         (buffer (codex-ide-session-buffer session)))
     (codex-ide-log-message session "Received notification %s" method)
-    (if (not (codex-ide--notification-belongs-to-session-p session params))
+    (if (not (and (codex-ide--notification-belongs-to-session-p session params method)
+                  (codex-ide--notification-current-turn-p session method params)))
         (codex-ide-log-message
          session
          "Ignoring notification %s for thread %s (session thread %s)"
@@ -6359,6 +6461,8 @@ compatibility with older app-server payloads and global notifications."
          (alist-get 'threadId params)
          (codex-ide-session-thread-id session))
       (pcase method
+        ("serverRequest/resolved"
+         (codex-ide--server-request-resolved session (alist-get 'requestId params)))
 	("thread/started"
 	 (codex-ide--remember-reasoning-effort session params)
 	 (codex-ide--remember-model-name session params)
@@ -6450,7 +6554,8 @@ compatibility with older app-server payloads and global notifications."
 		 (codex-ide-session-current-message-prefix-inserted session) nil
 		 (codex-ide-session-current-message-start-marker session) nil
 		 (codex-ide-session-item-states session) (make-hash-table :test 'equal))
-           (codex-ide--record-pending-turn-start session turn-id)
+           (when (equal turn-id (codex-ide--session-metadata-get session :local-turn-id))
+             (codex-ide--record-pending-turn-start session turn-id))
            (codex-ide--mark-current-turn-diff-started session turn-id)
            (codex-ide-session-diff-note-session-updated session))
 	 (codex-ide--set-session-status session "running" 'turn-started)
@@ -6467,8 +6572,12 @@ compatibility with older app-server payloads and global notifications."
           session
           :turn-id (codex-ide-session-current-turn-id session))
 	 (codex-ide--update-header-line session)
-	 (unless (codex-ide-session-output-prefix-inserted session)
-           (codex-ide--begin-turn-display session)))
+         ;; Observing a phone/client turn must not submit the editable draft.
+         (unless (codex-ide-session-output-prefix-inserted session)
+           (setf (codex-ide-session-output-prefix-inserted session) t)
+           (codex-ide--insert-pending-output-indicator session)
+           (unless (codex-ide--input-prompt-active-p session)
+             (codex-ide--insert-input-prompt session))))
 	("item/started"
 	 (when-let* ((item (alist-get 'item params)))
            (when (codex-ide--item-reports-turn-config-p item)
@@ -6489,7 +6598,9 @@ compatibility with older app-server payloads and global notifications."
               (alist-get 'id item)
               item)
              (codex-ide-session-diff-note-session-updated session))
-           (codex-ide--render-item-start session item)))
+           (if (equal (alist-get 'type item) "userMessage")
+               (codex-ide--render-live-user-message session item)
+             (codex-ide--render-item-start session item))))
 	("item/agentMessage/delta"
 	 (let ((item-id (alist-get 'itemId params))
                (delta (or (alist-get 'delta params) "")))
@@ -6586,7 +6697,9 @@ compatibility with older app-server payloads and global notifications."
               (alist-get 'id item)
               item)
              (codex-ide-session-diff-note-session-updated session))
-           (codex-ide--render-item-completion session item)))
+           (if (equal (alist-get 'type item) "userMessage")
+               (codex-ide--render-live-user-message session item)
+             (codex-ide--render-item-completion session item))))
 	("turn/completed"
 	 (let ((interrupted (codex-ide-session-interrupt-requested session))
                (turn-id (codex-ide-session-current-turn-id session)))
@@ -6921,7 +7034,10 @@ the mismatch warning only reflects meaningful behavior changes."
 
 (defun codex-ide--send-turn-start (session thread-id payload)
   "Send a `turn/start` request for SESSION THREAD-ID using PAYLOAD."
-  (let ((params (codex-ide--turn-start-params session thread-id payload)))
+  (let* ((params (codex-ide--turn-start-params session thread-id payload))
+         (echo-text (codex-ide--thread-read-display-user-text
+                     (codex-ide--thread-read--message-text
+                      `((content . ,(alist-get 'input params)))))))
     (codex-ide--session-metadata-put
      session
      :reasoning-effort
@@ -6934,10 +7050,23 @@ the mismatch warning only reflects meaningful behavior changes."
      session
      :submitted-turn-config-mismatch
      nil)
-    (codex-ide--request-sync
-     session
-     "turn/start"
-     params)))
+    (codex-ide--session-metadata-put session :local-turn-start-pending t)
+    (unwind-protect
+        (let* ((result (codex-ide--request-sync session "turn/start" params))
+               (turn-id (alist-get 'id (alist-get 'turn result))))
+          (codex-ide--session-metadata-put session :local-turn-id turn-id)
+          (when turn-id
+            (codex-ide--session-metadata-put
+             session :local-user-echoes
+             (cons (cons turn-id echo-text)
+                   (codex-ide--session-metadata-get session :local-user-echoes)))
+            (codex-ide--record-pending-turn-start session turn-id))
+          result)
+      (codex-ide--session-metadata-put session :local-turn-start-pending nil)
+      (let ((items (codex-ide--session-metadata-get session :pending-user-message-items)))
+        (codex-ide--session-metadata-put session :pending-user-message-items nil)
+        (dolist (entry (nreverse items))
+          (codex-ide--render-live-user-message session (cdr entry) (car entry)))))))
 
 (defun codex-ide--after-turn-start-submitted (session payload)
   "Update SESSION state after successfully submitting PAYLOAD."
@@ -7102,7 +7231,8 @@ LOCAL-IMAGES and IMAGE-DETAIL are forwarded to the app-server input payload."
          (effective-image-detail
           (codex-ide--submission-image-detail image-detail))
          prompt-to-send
-         payload)
+         payload
+         echo-key)
     (unless turn-id
       (user-error "No active Codex turn to steer"))
     (unless thread-id
@@ -7119,6 +7249,18 @@ LOCAL-IMAGES and IMAGE-DETAIL are forwarded to the app-server input payload."
      "Steering turn %s (%d chars)"
      turn-id
      (length prompt-to-send))
+    ;; Steering freezes its prompt locally just like turn/start.  Establish
+    ;; correlation before yielding to the process filter during the RPC.
+    (codex-ide--session-metadata-put session :local-turn-id turn-id)
+    (setq echo-key
+          (cons turn-id
+                (codex-ide--thread-read-display-user-text
+                 (codex-ide--thread-read--message-text
+                  `((content . ,(alist-get 'input payload)))))))
+    (codex-ide--session-metadata-put
+     session :local-user-echoes
+     (append (codex-ide--session-metadata-get session :local-user-echoes)
+             (list echo-key)))
     (condition-case err
         (progn
           (codex-ide--request-sync
@@ -7135,6 +7277,9 @@ LOCAL-IMAGES and IMAGE-DETAIL are forwarded to the app-server input payload."
           (codex-ide--refresh-running-input-display session)
           (message "Sent steering input to Codex"))
       (error
+       (codex-ide--session-metadata-put
+        session :local-user-echoes
+        (delq echo-key (codex-ide--session-metadata-get session :local-user-echoes)))
        (codex-ide-log-message session "Steering prompt failed: %s"
                               (error-message-string err))
        (codex-ide--reopen-input-after-submit-error session prompt-to-send err)
