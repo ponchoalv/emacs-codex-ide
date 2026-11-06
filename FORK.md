@@ -38,17 +38,86 @@ Run `M-x codex-ide-menu`:
 includes persisted chats whose buffers are closed. It is distinct from the
 upstream thread picker, which matches metadata such as titles/previews.
 
-Search is literal and case-insensitive (not a regexp or fuzzy title search).
-It scans all cursor pages and reads full persisted histories, independently of
-`codex-ide-resume-summary-turn-limit`. Searchable content is user and assistant
-message text, not tool output. Large collections can take time: progress is
-shown, `C-g` retains partial results, and unreadable threads are reported rather
-than silently skipped. Nothing is sent to an external search service.
+### Consult live content search (optional)
 
-In results, `RET` or `SPC` opens a read-only full-history preview at the exact
-match; `n`/`p` moves between results, `r` resumes the selected thread, and `q`
-quits. Preview does not resume the thread. Resuming uses the normal transcript
-renderer and its history limit, so an old match may only be visible in preview.
+When Consult is installed, `/` and `?` open a completion picker instead of
+asking for a literal query first. Type to filter full user/assistant message
+contents, not just titles or excerpts. Candidates identify the chat, project,
+and message. The picker previews full stored history:
+
+- `RET`: keep the selected read-only preview (the primary action).
+- `C-c C-r`: open the selected conversation directly as a live session.
+- Inside a preview, `r` or `C-c C-r`: open its live session.
+
+The secondary action resolves the current selected candidate, even when live
+preview is disabled, and resumes only after leaving and cleaning up the picker.
+Preview alone never resumes a thread. Existing shared-transport busy-attachment
+restrictions still apply; opening a session does not guarantee jumping to an
+older match outside its normal transcript replay limit.
+
+There is no universal Emacs completion binding for a secondary action.
+`C-c C-r` is a command-local convention consistent with this package's Occur
+results, not a global override. In particular, Vertico's `M-RET` retains its
+existing meaning of accepting raw minibuffer input; no Shift-RET dependency is
+introduced. Consult supports command-local action maps via its `:keymap` API.
+See [Consult](https://github.com/minad/consult) and
+[Vertico's keymap](https://github.com/minad/vertico/blob/main/vertico.el).
+
+Previews use the native session's user-prompt styling, spacing, separators and
+metadata faces, with source-preserving Markdown emphasis, headings and fenced
+code highlighting when available. They remain read-only snapshots, not session
+buffers: there is no editable prompt or tool/approval UI. Markdown delimiters,
+tables and links stay literal and visible so every stored character and exact
+search offset survives; the normal session renderer can rewrite that source.
+Large messages follow the renderer's existing highlighting size limit.
+
+The dedicated completion category is `codex-ide-message`. It preserves your
+configured completion styles, with built-in fuzzy `flex` as a fallback.
+Existing category defaults and `completion-category-overrides` take precedence.
+Your Consult preview-key preference is respected. To explicitly select
+Orderless matching (if you already use Orderless):
+
+```elisp
+(add-to-list 'completion-category-overrides
+             '(codex-ide-message (styles orderless flex)))
+```
+
+Histories are fetched once at the beginning of each invocation; filtering and
+previewing then work locally without an RPC for every keystroke. The initial
+scan can take time on large collections. There is no persistent content index.
+Consult is not installed automatically and is not a required dependency.
+
+### Literal fallback
+
+Without Consult, the commands prompt for a literal, case-insensitive query
+and display an **Occur-derived results buffer**. Lisp callers can also supply
+an explicit literal query, for example
+`(codex-ide-search-threads "socket timeout")`.
+Use `C-u M-x codex-ide-search-threads` (or its project variant) to choose the Occur interface
+even when Consult is installed.
+
+Standard Occur conventions apply:
+
+- `RET` or `C-c C-c`: visit the exact match in a read-only history snapshot.
+- `o`: visit in another window; `C-o`: display without selecting it.
+- `n` / `p`: show the next/previous match without selecting its buffer.
+- `M-g n` / `M-g p`: navigate using Emacs's standard `next-error` interface.
+- `M-n` / `M-p`: move between result entries.
+- `g`: rerun the search; `r`: rename the results buffer; `q`: quit.
+- `C-c C-r`: resume the selected chat (also `r` inside its history snapshot).
+
+Occur edit mode is deliberately unavailable: these are read-only stored chat
+snapshots, not editable files. Visiting a snapshot does not resume the chat.
+Resuming uses the normal transcript renderer and its history limit, so an old
+match may only be visible in the snapshot. Cancelling the initial scan retains
+partial Occur results; cancelling the Consult picker restores the prior window
+configuration.
+
+Both interfaces scan all cursor pages and full persisted histories,
+independently of `codex-ide-resume-summary-turn-limit`. Searchable content is
+user and assistant message text, not tool output. Progress is shown and
+unreadable threads are reported rather than silently skipped. Nothing is sent
+to an external search service.
 
 Archive uses the supported app-server API, not deletion of rollout files.
 Archiving may also archive spawned descendant threads. It is reversible via

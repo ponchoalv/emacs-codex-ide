@@ -1312,20 +1312,26 @@ PROPERTIES is appended to the inserted region.  Return (START . END)."
     (codex-ide-renderer-freeze-region start (point))
     (cons start (point))))
 
-(defun codex-ide-renderer-insert-restored-user-message (text)
-  "Insert restored user TEXT at point and return (START . END)."
+(defun codex-ide-renderer-insert-restored-user-message (text &optional body-bounds)
+  "Insert restored user TEXT at point and return (START . END).
+When BODY-BOUNDS is non-nil, return the exact bounds of TEXT instead of
+those of the prompt prefix, body, and bottom padding."
   (codex-ide-renderer-insert-output-spacing)
   (let ((display-start (point))
-        prompt-start)
+        prompt-start body-start body-end)
     (codex-ide-renderer-insert-user-prompt-top-padding)
     (setq prompt-start (point))
     (codex-ide-renderer-insert-prompt-prefix)
+    (setq body-start (point))
     (insert text)
+    (setq body-end (point))
     (codex-ide-renderer-style-user-prompt-region prompt-start (point))
     (codex-ide-renderer-freeze-region display-start (point))
     (codex-ide-renderer-insert-user-prompt-bottom-padding)
     (codex-ide-renderer-freeze-region display-start (point))
-    (cons prompt-start (point))))
+    (if body-bounds
+        (cons body-start body-end)
+      (cons prompt-start (point)))))
 
 (defun codex-ide-renderer-insert-interactive-request-shell (title render-body)
   "Insert a standard interactive-request shell with TITLE.
@@ -1950,19 +1956,17 @@ intentionally ignored."
          t)
      (error nil))))
 
-(defun codex-ide-renderer--fontify-code-block-region (start end language)
-  "Apply syntax highlighting to region START END using LANGUAGE."
+(cl-defun codex-ide-renderer--fontify-code-block-region
+    (start end language &key allowed-modes)
+  "Apply syntax highlighting to region START END using LANGUAGE.
+When ALLOWED-MODES is non-nil, only those explicit mode functions may run."
   (let ((source-buffer (current-buffer))
         (code (buffer-substring-no-properties start end)))
     (cl-some
      (lambda (mode)
-       (codex-ide-renderer--fontify-code-block-with-mode
-        source-buffer
-        start
-        end
-        code
-        language
-        mode))
+       (when (or (null allowed-modes) (memq mode allowed-modes))
+         (codex-ide-renderer--fontify-code-block-with-mode
+          source-buffer start end code language mode)))
      (codex-ide-renderer--markdown-language-mode-candidates language))))
 
 (defun codex-ide-renderer-fontify-code-block-region (start end language)
@@ -2818,6 +2822,92 @@ TABLE-MAX-WIDTH is the effective table width to use for this pass."
   (and (integerp codex-ide-renderer-markdown-render-max-chars)
        (or (<= codex-ide-renderer-markdown-render-max-chars 0)
            (> (- end start) codex-ide-renderer-markdown-render-max-chars))))
+
+(defconst codex-ide-renderer--source-code-major-modes
+  '(sh-mode c-mode c++-mode emacs-lisp-mode lisp-mode go-mode java-mode
+    js-mode json-mode js-json-mode python-mode ruby-mode rust-mode
+    typescript-mode yaml-mode conf-mode)
+  "Explicit major modes allowed to fontify read-only stored source.
+Never dispatch arbitrary `<fence-language>-mode' functions: a stored language
+name could otherwise invoke a global or minor mode with Emacs-wide effects.")
+
+(defun codex-ide-renderer--fontify-markdown-source-prose (start end)
+  "Add faces to raw Markdown prose between START and END."
+  (let (code-spans)
+    ;; Keep ordered intervals and advance a cursor rather than repeatedly
+    ;; scanning every prior code span (quadratic for messages full of `code').
+    (goto-char start)
+    (while (re-search-forward "^\\(?:    \\|\t\\).*" end t)
+      (push (cons (match-beginning 0) (match-end 0)) code-spans))
+    (setq code-spans (nreverse code-spans))
+    (let ((indented code-spans))
+      (goto-char start)
+      (while (re-search-forward codex-ide-renderer--markdown-inline-code-pattern end t)
+        (while (and indented (<= (cdar indented) (match-beginning 0)))
+          (setq indented (cdr indented)))
+        (unless (and indented (< (caar indented) (match-end 0)))
+          (add-face-text-property (match-beginning 1) (match-end 1)
+                                  'font-lock-keyword-face 'append)
+          (push (cons (match-beginning 0) (match-end 0)) code-spans))))
+    (setq code-spans (sort code-spans (lambda (a b) (< (car a) (car b)))))
+    (dolist (spec `(("^ \\{0,3\\}#\\{1,6\\}[ \t]+.+" 0 font-lock-function-name-face)
+                    (,codex-ide-renderer--markdown-bold-asterisk-pattern 3 bold)
+                    (,codex-ide-renderer--markdown-bold-underscore-pattern 3 bold t)
+                    (,codex-ide-renderer--markdown-italic-asterisk-pattern 3 italic)
+                    (,codex-ide-renderer--markdown-italic-underscore-pattern 3 italic t)))
+      (let ((remaining code-spans))
+        (goto-char start)
+        (while (re-search-forward (car spec) end t)
+          (let ((span-start (match-beginning (if (eq (nth 1 spec) 0) 0 2)))
+                (span-end (match-end (if (eq (nth 1 spec) 0) 0 2)))
+                (content-start (match-beginning (nth 1 spec)))
+                (content-end (match-end (nth 1 spec))))
+            (while (and remaining (<= (cdar remaining) span-start))
+              (setq remaining (cdr remaining)))
+            (unless (or (and remaining (< (caar remaining) span-end))
+                        (and (nth 3 spec)
+                             (not (codex-ide-renderer--markdown-emphasis-underscore-boundary-p
+                                   span-start span-end))))
+              (add-face-text-property content-start content-end (nth 2 spec) 'append))))))))
+
+(defun codex-ide-renderer-fontify-markdown-source-region (start end)
+  "Style raw Markdown between START and END without changing its source.
+Only face properties are added: markers, whitespace, tables, and links
+remain literal, with no concealment, buttons, or actions.  Code syntax
+highlighting uses temporary buffers, never modes or hooks in this buffer.
+Regions exceeding `codex-ide-renderer-markdown-render-max-chars' stay plain."
+  (unless (codex-ide-renderer--markdown-region-over-size-limit-p start end)
+    (codex-ide-renderer--without-undo-recording
+     (save-excursion
+       (save-match-data
+         (save-restriction
+           (narrow-to-region start end)
+           (let ((inhibit-read-only t)
+                 (prose-start start))
+             (goto-char start)
+             (while (re-search-forward "^[ \t]*\\(`\\{3,\\}\\|~\\{3,\\}\\)\\([^`\n]*\\)$" end t)
+               (let* ((fence-start (match-beginning 0))
+                      (fence (match-string-no-properties 1))
+                      (language (string-trim (match-string-no-properties 2)))
+                      (code-start (min end (1+ (match-end 0))))
+                      (closing-pattern
+                       (format "^[ \t]*%s\\{%d,\\}[ \t]*$"
+                               (regexp-quote (substring fence 0 1)) (length fence)))
+                      (code-end end)
+                      (block-end end))
+                 (when (re-search-forward closing-pattern end t)
+                   (setq code-end (match-beginning 0)
+                         block-end (min end (1+ (match-end 0)))))
+                 (codex-ide-renderer--fontify-markdown-source-prose prose-start fence-start)
+                 (add-face-text-property code-start code-end 'fixed-pitch 'append)
+                 ;; This helper copies only faces, not mode display properties.
+                 (codex-ide-renderer--fontify-code-block-region
+                  code-start code-end language
+                  :allowed-modes codex-ide-renderer--source-code-major-modes)
+                 (setq prose-start block-end)
+                 (goto-char block-end)))
+             (codex-ide-renderer--fontify-markdown-source-prose prose-start end))))))
+    t))
 
 (defun codex-ide-renderer-maybe-render-markdown-region (start end &optional allow-trailing-tables)
   "Render markdown between START and END unless the region is too large."
